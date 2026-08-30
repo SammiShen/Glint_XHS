@@ -1,11 +1,12 @@
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
 import { config } from "./config.js";
 import { log } from "./logger.js";
+import { checkCdpEndpoint, formatCdpError } from "./cdp.js";
+import { createThrottler } from "./throttle.js";
 
 const XHS_HOST = "xiaohongshu.com";
 
 let browserPromise: Promise<Browser> | null = null;
-let lastActionAt = 0;
 
 /**
  * 连接到用户本地已经登录小红书的浏览器实例（通过 CDP），而不是启动一个全新的
@@ -22,15 +23,26 @@ async function connect(): Promise<Browser> {
 
 async function getBrowser(): Promise<Browser> {
   if (!browserPromise) {
-    browserPromise = connect().catch((err) => {
+    browserPromise = (async () => {
+      // 先探测 /json/version，把"端口没监听" / "端口被别的程序占用" / "网络不通"
+      // 这几种情况区分开，而不是笼统地报"可能未登录"。
+      const preflight = await checkCdpEndpoint(config.cdpUrl);
+      if (preflight.status !== "ok") {
+        throw new Error(formatCdpError(config.cdpUrl, preflight));
+      }
+      try {
+        return await connect();
+      } catch (err) {
+        // 探测正常但 Playwright 自己连接失败，是第三种、更少见的情况，单独给出说明。
+        throw new Error(
+          `CDP 探测（/json/version）正常，但 Playwright 通过 connectOverCDP 建立连接失败。\n` +
+            "可能原因：该端口不是 Chromium 内核浏览器、调试协议版本不兼容，或浏览器在探测后立刻退出了。\n" +
+            `原始错误：${(err as Error).message}`,
+        );
+      }
+    })().catch((err) => {
       browserPromise = null;
-      throw new Error(
-        `无法通过 CDP 连接到本地浏览器（${config.cdpUrl}）。请确认：\n` +
-          "1. 已用 --remote-debugging-port 启动 Chrome/Edge 并登录小红书；\n" +
-          "2. 该端口没有被其他程序占用或防火墙拦截；\n" +
-          `3. XHS_CDP_URL 环境变量指向正确的调试地址（当前为 ${config.cdpUrl}）。\n` +
-          `原始错误：${(err as Error).message}`,
-      );
+      throw err;
     });
   }
   return browserPromise;
@@ -58,24 +70,15 @@ async function getXhsContext(browser: Browser): Promise<BrowserContext> {
   return contexts[0];
 }
 
-/** 简单节流：两次操作之间强制间隔一段随机时长，避免请求过于频繁触发风控。 */
-async function throttle(): Promise<void> {
-  const wait = config.minDelayMs + Math.random() * config.maxDelayJitterMs;
-  const elapsed = Date.now() - lastActionAt;
-  const remaining = wait - elapsed;
-  if (remaining > 0) {
-    await new Promise((resolve) => setTimeout(resolve, remaining));
-  }
-  lastActionAt = Date.now();
-}
+const throttler = createThrottler(() => config.minDelayMs + Math.random() * config.maxDelayJitterMs);
 
 /**
- * 获取一个可用的小红书标签页，并在使用前做节流。
+ * 获取一个可用的小红书标签页，并在使用前做节流（真正串行排队，见 throttle.ts）。
  * 每次调用都会打开一个新标签页用于本次操作，用完后关闭它，
  * 尽量不打扰用户原本打开的标签页（例如首页 feed 的滚动位置）。
  */
 export async function withXhsPage<T>(fn: (page: Page) => Promise<T>): Promise<T> {
-  await throttle();
+  await throttler.wait();
   const browser = await getBrowser();
   const ctx = await getXhsContext(browser);
   const page = await ctx.newPage();

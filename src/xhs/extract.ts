@@ -1,22 +1,61 @@
 import type { Page, Response } from "playwright";
 import { config } from "../config.js";
 
+const XHS_HOST_SUFFIX = "xiaohongshu.com";
+// 宽松但不失底线的 ID 格式：字母数字（外加 - _），长度 6~64。
+// 目前观察到的小红书笔记/用户 ID 是 24 位十六进制字符串，但没有把长度/字符集写死到刚好 24 位，
+// 避免以后格式变化就直接判定所有输入非法；这里只挡明显不是 ID 的垃圾输入（整句话、域名、空字符串等）。
+const ID_PATTERN = /^[a-zA-Z0-9_-]{6,64}$/;
+
+function assertXhsHost(url: URL, original: string): void {
+  const host = url.hostname.toLowerCase();
+  if (host !== XHS_HOST_SUFFIX && !host.endsWith(`.${XHS_HOST_SUFFIX}`)) {
+    throw new Error(`链接的域名不属于小红书（实际是 "${host}"）：${original}。本工具只处理 xiaohongshu.com 域名下的链接。`);
+  }
+}
+
+function assertValidId(id: string, kind: "笔记" | "用户", original: string): void {
+  if (!ID_PATTERN.test(id)) {
+    throw new Error(
+      `无法从输入中解析出合法的${kind} ID："${id}"（原始输入：${original}）。` +
+        `请传入完整的小红书链接，或者${kind} ID 本身（字母、数字、- 或 _ 组成，长度 6~64）。`,
+    );
+  }
+}
+
+function parseUrlOrThrow(input: string): URL {
+  try {
+    return new URL(input);
+  } catch {
+    throw new Error(`不是合法的链接：${input}`);
+  }
+}
+
 /**
  * 从各种形式的小红书链接/ID 中解析出 noteId 和 xsec_token（部分详情/评论接口需要 token 才能正常返回）。
+ * 会校验链接域名确实属于 xiaohongshu.com，并对解析出的 ID 做基本格式校验，
+ * 不会把任意网址的最后一段路径当成 noteId。
  */
 export function parseNoteRef(input: string): { noteId: string; xsecToken?: string } {
   const trimmed = input.trim();
+  if (!trimmed) {
+    throw new Error("笔记链接/ID 不能为空。");
+  }
   if (!/^https?:\/\//i.test(trimmed)) {
-    // 直接传入的是 noteId（24 位十六进制字符串）
+    assertValidId(trimmed, "笔记", input);
     return { noteId: trimmed };
   }
-  const url = new URL(trimmed);
+
+  const url = parseUrlOrThrow(trimmed);
+  assertXhsHost(url, input);
+
   const segments = url.pathname.split("/").filter(Boolean);
   const noteId = segments[segments.length - 1];
-  const xsecToken = url.searchParams.get("xsec_token") ?? undefined;
   if (!noteId) {
-    throw new Error(`无法从链接中解析出笔记 ID：${input}`);
+    throw new Error(`无法从链接中解析出笔记 ID（链接里没有可用的路径片段）：${input}`);
   }
+  assertValidId(noteId, "笔记", input);
+  const xsecToken = url.searchParams.get("xsec_token") ?? undefined;
   return { noteId, xsecToken };
 }
 
@@ -29,17 +68,28 @@ export function buildExploreUrl(noteId: string, xsecToken?: string): string {
   return url.toString();
 }
 
+/**
+ * 从各种形式的小红书用户主页链接/ID 中解析出 userId，校验规则与 parseNoteRef 一致。
+ */
 export function parseUserRef(input: string): string {
   const trimmed = input.trim();
+  if (!trimmed) {
+    throw new Error("用户链接/ID 不能为空。");
+  }
   if (!/^https?:\/\//i.test(trimmed)) {
+    assertValidId(trimmed, "用户", input);
     return trimmed;
   }
-  const url = new URL(trimmed);
+
+  const url = parseUrlOrThrow(trimmed);
+  assertXhsHost(url, input);
+
   const segments = url.pathname.split("/").filter(Boolean);
   const userId = segments[segments.length - 1];
   if (!userId) {
-    throw new Error(`无法从链接中解析出用户 ID：${input}`);
+    throw new Error(`无法从链接中解析出用户 ID（链接里没有可用的路径片段）：${input}`);
   }
+  assertValidId(userId, "用户", input);
   return userId;
 }
 
