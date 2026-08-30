@@ -177,6 +177,13 @@ export function firstDefined<T>(...values: (T | undefined | null)[]): T | undefi
   return undefined;
 }
 
+/** 把任意值当作普通对象读取，不是对象（含 null/数组等基础类型不算）时返回 undefined。 */
+export function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
 /** 安全地按路径读取嵌套对象的值，任意一层不存在都返回 undefined 而不是抛错。 */
 export function getPath(obj: unknown, path: (string | number)[]): unknown {
   let cur: unknown = obj;
