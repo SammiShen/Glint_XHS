@@ -1,65 +1,24 @@
-import type { Page, Response } from "playwright";
+import type { Page } from "playwright";
 import { config } from "../config.js";
 import { withXhsPage, looksLoggedOut } from "../browser.js";
-import { asRecord, firstDefined, parseCount, scrollDown, sleep } from "./extract.js";
+import {
+  asRecord,
+  collectXhsResponses,
+  firstDefined,
+  isXhsHost,
+  parseCount,
+  scrollDown,
+  sleep,
+  type CapturedResponse,
+} from "./extract.js";
 import type { SearchResultItem } from "./types.js";
 import { log } from "../logger.js";
 
 /**
  * 曾经观察到的搜索接口路径，仅用于日志标注"是否命中已知路径"，
- * 实际抓取不再依赖这个精确路径匹配（见 collectXhsSearchResponses）。
+ * 实际抓取不再依赖这个精确路径匹配（见 extract.ts 的 collectXhsResponses）。
  */
 const KNOWN_SEARCH_API = "/api/sns/web/v1/search/notes";
-
-interface CapturedResponse {
-  url: string;
-  status: number;
-  json?: unknown;
-  jsonError?: string;
-}
-
-/**
- * 不再只等待一个硬编码 endpoint 的响应，而是在整次搜索期间持续监听所有
- * "域名属于 xiaohongshu.com 且 URL 包含 search"的响应，记录下来供诊断和解析。
- * 这样即使小红书把接口路径从 KNOWN_SEARCH_API 换成别的名字，也还能捕获到。
- */
-function collectXhsSearchResponses(page: Page): {
-  candidates: CapturedResponse[];
-  waitForPending: () => Promise<void>;
-  stop: () => void;
-} {
-  const candidates: CapturedResponse[] = [];
-  const pending: Promise<void>[] = [];
-  const handler = (res: Response) => {
-    let host: string;
-    try {
-      host = new URL(res.url()).hostname;
-    } catch {
-      return;
-    }
-    if (!host.endsWith("xiaohongshu.com")) return;
-    if (!/search/i.test(res.url())) return;
-
-    const entry: CapturedResponse = { url: res.url(), status: res.status() };
-    candidates.push(entry);
-    pending.push(
-      res
-        .json()
-        .then((json) => {
-          entry.json = json;
-        })
-        .catch((err) => {
-          entry.jsonError = err instanceof Error ? err.message : String(err);
-        }),
-    );
-  };
-  page.on("response", handler);
-  return {
-    candidates,
-    waitForPending: () => Promise.all(pending).then(() => undefined),
-    stop: () => page.off("response", handler),
-  };
-}
 
 /** 从任意形状的响应 JSON 里找"结果条目数组"，兼容几种常见的顶层字段命名。 */
 function extractItemsArray(json: unknown): unknown[] {
@@ -253,7 +212,7 @@ export async function searchNotes(keyword: string, limit = 20): Promise<SearchRe
   const cappedLimit = Math.min(Math.max(limit, 1), 60);
 
   return withXhsPage(async (page) => {
-    const collector = collectXhsSearchResponses(page);
+    const collector = collectXhsResponses(page, (u) => isXhsHost(u) && /search/i.test(u));
     const collected = new Map<string, SearchResultItem>();
 
     try {

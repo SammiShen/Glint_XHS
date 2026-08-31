@@ -1,5 +1,4 @@
 import type { Page, Response } from "playwright";
-import { config } from "../config.js";
 
 const XHS_HOST_SUFFIX = "xiaohongshu.com";
 // 宽松但不失底线的 ID 格式：字母数字（外加 - _），长度 6~64。
@@ -108,26 +107,85 @@ export function parseCount(raw: unknown): number | undefined {
   return base;
 }
 
-/**
- * 在触发页面导航/交互之前先挂好 response 监听，等待第一个匹配 urlIncludes 的、
- * 状态码 2xx 的 JSON 响应。避免"请求已经发出但监听器还没挂上"导致错过响应。
- */
-export async function captureJsonResponse<T = unknown>(
-  page: Page,
-  urlIncludes: string,
-  trigger: () => Promise<unknown>,
-  timeoutMs: number = config.responseTimeoutMs,
-): Promise<T | null> {
-  const waiter = page
-    .waitForResponse(
-      (res: Response) => res.url().includes(urlIncludes) && res.status() >= 200 && res.status() < 300,
-      { timeout: timeoutMs },
-    )
-    .then((res: Response) => res.json() as Promise<T>)
-    .catch(() => null);
+export function isXhsHost(urlStr: string): boolean {
+  try {
+    return new URL(urlStr).hostname.toLowerCase().endsWith(XHS_HOST_SUFFIX);
+  } catch {
+    return false;
+  }
+}
 
-  await trigger();
-  return waiter;
+export interface CapturedResponse {
+  url: string;
+  status: number;
+  json?: unknown;
+  jsonError?: string;
+}
+
+/**
+ * 在整个操作期间持续监听匹配 predicate 的响应，而不是只等第一个就返回——
+ * 既能在诊断日志里看到"实际命中了哪些接口"，也不会因为接口路径改名就完全捕获不到。
+ * 调用方需要在自己认为"该收的都收到了"之后调用 waitForPending() 确保异步的
+ * response.json() 都已经落地，再读取 candidates。
+ */
+export function collectXhsResponses(
+  page: Page,
+  predicate: (url: string) => boolean,
+): { candidates: CapturedResponse[]; waitForPending: () => Promise<void>; stop: () => void } {
+  const candidates: CapturedResponse[] = [];
+  const pending: Promise<void>[] = [];
+  const handler = (res: Response) => {
+    if (!predicate(res.url())) return;
+    const entry: CapturedResponse = { url: res.url(), status: res.status() };
+    candidates.push(entry);
+    pending.push(
+      res
+        .json()
+        .then((json) => {
+          entry.json = json;
+        })
+        .catch((err) => {
+          entry.jsonError = err instanceof Error ? err.message : String(err);
+        }),
+    );
+  };
+  page.on("response", handler);
+  return {
+    candidates,
+    waitForPending: () => Promise.all(pending).then(() => undefined),
+    stop: () => page.off("response", handler),
+  };
+}
+
+/** DOM 里挖出来的一个"可能是标题/正文"的候选文本，带一些用于排除导航栏等 UI 元素的元信息。 */
+export interface DomTextCandidate {
+  text: string;
+  isChrome: boolean;
+  anchorCount: number;
+}
+
+const MIN_CONTENT_LENGTH = 20;
+const MAX_CANDIDATE_ANCHORS = 2;
+
+/**
+ * 从若干候选文本里挑正文：排除位于 nav/header/aside/footer 等导航型容器里的候选、
+ * 排除内部链接数偏多（典型导航菜单特征）的候选，剩下的按文本长度取最长的一个——
+ * 真实笔记正文几乎总是比任何一条导航栏文案长得多，这比"选第一个匹配的元素"稳健得多。
+ */
+export function pickContentCandidate(candidates: DomTextCandidate[]): string | undefined {
+  const usable = candidates.filter(
+    (c) => !c.isChrome && c.anchorCount <= MAX_CANDIDATE_ANCHORS && c.text.length >= MIN_CONTENT_LENGTH,
+  );
+  if (usable.length === 0) return undefined;
+  return usable.reduce((best, cur) => (cur.text.length > best.text.length ? cur : best)).text;
+}
+
+/** 标题候选比正文候选短得多，"取最长"这个信号不适用，只做导航栏排除后取第一个。 */
+export function pickTitleCandidate(candidates: DomTextCandidate[]): string | undefined {
+  const usable = candidates.find(
+    (c) => !c.isChrome && c.anchorCount <= MAX_CANDIDATE_ANCHORS && c.text.length > 0,
+  );
+  return usable?.text;
 }
 
 /**
